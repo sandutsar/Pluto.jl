@@ -42,3 +42,5 @@ HTTP.get("http://github.com")
     HTTP.get("http://localhost:$port/edit").status == 200
     server_task
 end
+
+show(TOUT; compact=true, sortby=:firstexec)

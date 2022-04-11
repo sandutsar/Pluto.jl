@@ -45,8 +45,6 @@ verify_no_running_processes()
 
 verify_no_running_processes()
 
-show(TOUT; compact=true, sortby=:firstexec)
-
 # TODO: test PlutoRunner functions like:
 # - from_this_notebook
 

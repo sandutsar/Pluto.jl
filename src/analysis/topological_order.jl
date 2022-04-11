@@ -7,14 +7,280 @@ end
 
 @deprecate topological_order(::Notebook, topology::NotebookTopology, args...; kwargs...) topological_order(topology, args...; kwargs...)
 
+Base.@kwdef mutable struct Node
+    disabled::Bool = false
+    cycle::Union{Nothing,CyclicReferenceError} = nothing
+    multiple_definitions::Union{Nothing,MultipleDefinitionsError} = nothing
+
+    downstream::Vector{Cell} = Cell[]
+    upstream::Vector{Cell} = Cell[]
+end
+
+Base.@kwdef struct Tree
+    nodes::Dict{Cell,Node} = Dict{Cell,Node}()
+    cell_order::Vector{Cell} = Dict{Cell,Node}()
+end
+
+"""
+    build_tree(topology::NotebookTopology, roots::AbstractVector{Cell})::Tree
+
+This function builds a lineage tree between cells starting from the given roots using
+a modified depth first search algorithm to explore the graph and attempt to make it
+resistant to a certain type of edge that should only be present if there are no cycle.
+
+In case of a cycle, it backtracks until it find a soft edge (an edge that can be broken)
+to remove from the graph. These soft edges are used to implement a set of cell dependencies
+that are nice to have but not a 100% reliable.
+"""
+function build_tree(topology::NotebookTopology, roots::AbstractVector{Cell})
+    # We use vectors to enable backtracking
+    entries = Cell[]
+    exits = Cell[]
+    relationships = Pair{Cell,Cell}[] # 👪
+
+    cycles = Dict{Cell,CyclicReferenceError}()
+
+    # https://xkcd.com/2407/
+    function dfs(cell::Cell)
+        if cell in exits
+            return Ok()
+        elseif haskey(cycles, cell)
+            return Ok()
+        elseif cell in entries
+            currently_in = setdiff(entries, exits)
+            cycle = currently_in[findfirst(isequal(cell), currently_in):end]
+
+            if !cycle_is_among_functions(topology, cycle)
+                for cell in cycle
+                    cycles[cell] = CyclicReferenceError(topology, cycle)
+                end
+                return Cycle(cycle)
+            end
+
+            # TODO: the built tree has a cycle
+            #       the parent should:
+            #
+            #   pop!(relationships)
+            @warn "we probably let a cycle happen!"
+
+            return Ok()
+        end
+
+        # used for cleanups of wrong cycles
+        current_entries_num = length(entries)
+        current_exits_num = length(exits)
+        current_relationships_num = length(relationships)
+
+        push!(entries, cell)
+
+        referencers = where_referenced(topology, cell) |> Iterators.reverse
+        for c in referencers
+            if c != cell
+                child_result = dfs(c)
+
+                # No cycle for this child or the cycle has no soft edges
+                if child_result isa Ok || cell ∉ child_result.cycled_cells
+                    push!(relationships, cell => c)
+                    continue
+                end
+
+                # Can we cleanup the cycle from here or is it caused by a parent cell?
+                # if the edge to the child cell is composed of soft assigments only then we can try to "break"
+                # it else we bubble the result up to the parent until it is
+                # either out of the cycle or a soft-edge is found
+                if !is_soft_edge(topology, cell, c)
+                    deleteat!(entries, current_entries_num+1:length(entries))
+                    deleteat!(exits, current_exits_num+1:length(exits))
+                    deleteat!(relationships, current_relationships_num+1:length(relationships))
+                    return child_result
+                end
+
+                # Here we found a soft edge than can be broken for this cycle!
+                # there is still a tiny bit of cleanup that is needed 🧹
+                # to cancel exploring this child (c)
+
+                # 1. Cleanup the cycles
+                for cycled_cell in child_result.cycled_cells
+                    delete!(cycles, cycled_cell)
+                end
+
+                # 2. Remove the current child (c) from the entries if it was just added
+                if entries[end] == c
+                    pop!(entries)
+                end
+
+                continue # let's get to the next children
+            end
+        end
+
+        push!(exits, cell)
+
+        Ok()
+    end
+
+    prelim_order_1 = sort(roots, alg=MergeSort, by=c -> cell_precedence_heuristic(topology, c))
+    prelim_order_2 = Iterators.reverse(prelim_order_1)
+
+    dfs.(prelim_order_2)
+
+    nodes = Dict{Cell,Node}(cell => Node() for cell in exits)
+
+    # Build the actual tree 🎄
+    for (parent, child) in unique(relationships)
+        push!(nodes[parent].downstream, child)
+        push!(nodes[child].upstream, parent)
+    end
+
+    for (errored, cycle) in cycles
+        nodes[errored].cycle = cycle
+    end
+
+    Tree(; nodes, cell_order=prelim_order_1)
+end
+
+"A bfs to inherit what the parents have themselves inherited"
+function inheritance_bfs(f::Function, tree::Tree)
+    indegrees = Dict{Cell,Int}()
+    queue = Cell[]
+
+    for cell in tree.cell_order # TODO: work with only a subset of roots
+        indegree = indegrees[cell] = length(tree.nodes[cell].upstream)
+        if indegree == 0
+            push!(queue, cell)
+        end
+    end
+
+    user_values = Dict{Cell,Bool}()
+
+    order = Cell[]
+    while !isempty(queue)
+        current_cell = popfirst!(queue)
+        push!(order, current_cell)
+
+        if haskey(user_values, current_cell)
+            error("TODO: There is cycle and there should not be one")
+        end
+
+        user_values[current_cell] = f(
+            current_cell,
+            [user_values[parent] for parent in tree.nodes[current_cell].upstream],
+        )
+
+        for child in tree.nodes[current_cell].downstream
+            indegrees[child] -= 1
+
+            if indegrees[child] == 0
+                push!(queue, child)
+            end
+        end
+    end
+
+    order
+end
+
+# Yet another dfs 😬
+function order(topology::NotebookTopology, tree::Tree)
+    entries = Cell[]
+    exits = Cell[]
+
+    errable = Dict{Cell,ReactivityError}()
+    for (cell, node) in tree.nodes
+        if node.cycle !== nothing
+            errable[cell] = node.cycle
+        elseif node.multiple_definitions !== nothing
+            errable[cell] = node.multiple_definitions
+        end
+    end
+
+    function dfs(cell::Cell)::ChildExplorationResult
+        if cell in exits
+            return Ok()
+        elseif haskey(errable, cell)
+            return Ok()
+        elseif length(entries) > 0 && entries[end] == cell
+            return Ok()
+        elseif cell in entries
+            error("There is still a cycle")
+            return NotOk()
+        end
+
+        node = tree.nodes[cell]
+
+        if node.disabled
+            return Ok()
+        end
+
+
+        for child in tree.nodes[cell].downstream
+            dfs(child)
+        end
+
+        push!(exits, cell)
+
+        Ok()
+    end
+
+    dfs.(tree.cell_order)
+
+    ordered = reverse(exits)
+    TopologicalOrder(topology, ordered, errable)
+end
+
+# TODO: move somewhere relevant
+hard_definitions(topology::NotebookTopology, cell::Cell) =
+    union(topology.nodes[cell].definitions, topology.nodes[cell].funcdefs_without_signatures)
+
+function compute_disabled_and_multiple_definitions!(tree::Tree, topology::NotebookTopology)
+    all_cells = inheritance_bfs(tree) do cell, parents_disabling
+        tree.nodes[cell].disabled = is_disabled(cell) || any(parents_disabling)
+    end
+
+    for cell in all_cells
+        assigners = where_assigned(topology, cell)
+
+        # We handle the multiple definitions symbol-wise
+        if length(assigners) > 1
+            # assigned = mapreduce(c -> hard_definitions(topology, c), union!, assigner; init=Set{Symbol}())
+
+            for assigner in assigners
+                if tree.nodes[assigner].disabled
+                    continue
+                end
+                assigned = hard_definitions(topology, assigner)
+
+                competitors = [
+                    other
+                    for other in assigners
+                    if other != assigner && !tree.nodes[other].disabled &&
+                        !disjoint(hard_definitions(topology, assigner), assigned)
+                ]
+
+                if !isempty(competitors)
+                    @show competitors
+                    tree.nodes[assigner].multiple_definitions =
+                        MultipleDefinitionsError(topology, assigner, competitors)
+                end
+            end
+        end
+    end
+
+    tree
+end
+
+
 "Return a `TopologicalOrder` that lists the cells to be evaluated in a single reactive run, in topological order. Includes the given roots."
 function topological_order(topology::NotebookTopology, roots::AbstractVector{Cell}; allow_multiple_defs=false)::TopologicalOrder
+    tree = build_tree(topology, roots)
+    compute_disabled_and_multiple_definitions!(tree, topology)
+    return order(topology, tree)
+
+
 	entries = Cell[]
 	exits = Cell[]
 	errable = Dict{Cell,ReactivityError}()
 
 	# https://xkcd.com/2407/
-	function bfs(cell::Cell)::ChildExplorationResult
+	function dfs(cell::Cell)::ChildExplorationResult
 		if cell in exits
 			return Ok()
 		elseif haskey(errable, cell)
@@ -50,7 +316,7 @@ function topological_order(topology::NotebookTopology, roots::AbstractVector{Cel
 		referencers = where_referenced(topology, cell) |> Iterators.reverse
 		for c in (allow_multiple_defs ? referencers : union(assigners, referencers))
 			if c != cell
-				child_result = bfs(c)
+				child_result = dfs(c)
 
 				# No cycle for this child or the cycle has no soft edges
 				if child_result isa Ok || cell ∉ child_result.cycled_cells
@@ -90,7 +356,7 @@ function topological_order(topology::NotebookTopology, roots::AbstractVector{Cel
 	prelim_order_1 = sort(roots, alg=MergeSort, by=c -> cell_precedence_heuristic(topology, c))
 	# reversing because our search returns reversed order
 	prelim_order_2 = Iterators.reverse(prelim_order_1)
-	bfs.(prelim_order_2)
+	dfs.(prelim_order_2)
 	ordered = reverse(exits)
 	TopologicalOrder(topology, setdiff(ordered, keys(errable)), errable)
 end
