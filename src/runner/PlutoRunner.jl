@@ -890,7 +890,7 @@ See [`allmimes`](@ref) for the ordered list of supported MIME types.
 """
 function format_output_default(@nospecialize(val), @nospecialize(context=default_iocontext))::MimedOutput
     try
-        io_sprinted, (value, mime) = sprint_withreturned(show_richest, val; context=context)
+        io_sprinted, (value, mime) = sprint_richest(show_richest, val; context)
         if value === nothing
             if mime ∈ imagemimes
                 (io_sprinted, mime)
@@ -906,6 +906,7 @@ function format_output_default(@nospecialize(val), @nospecialize(context=default
         format_output(CapturedException(title, bt))
     end
 end
+precompile(format_output_default, (Tuple,))
 
 format_output(@nospecialize(x); context=default_iocontext) = format_output_default(x, context)
 
@@ -980,10 +981,10 @@ function pretty_stackcall(frame::Base.StackFrame, linfo::Core.MethodInstance)
 end
 
 "Like `Base.sprint`, but return a `(String, Any)` tuple containing function output as the second entry."
-function sprint_withreturned(f::Function, args...; context=nothing, sizehint::Integer=0)
-    buffer = IOBuffer(sizehint=sizehint)
-    val = f(IOContext(buffer, context), args...)
-    resize!(buffer.data, buffer.size), val
+function sprint_richest(f::Function, val; context=nothing, sizehint::Integer=0)
+    buffer = IOBuffer(; sizehint)
+    retval = show_richest(IOContext(buffer, context), val)
+    resize!(buffer.data, buffer.size), retval
 end
 
 "Super important thing don't change."
@@ -1017,7 +1018,7 @@ Like two-argument `Base.show`, except:
 2. the used MIME type is returned as second element
 3. if the first returned element is `nothing`, then we wrote our data to `io`. If it is something else (a Dict), then that object will be the cell's output, instead of the buffered io stream. This allows us to output rich objects to the frontend that are not necessarily strings or byte streams
 """
-function show_richest(io::IO, @nospecialize(x))::Tuple{<:Any,MIME}
+function show_richest(io::IO, x)::Tuple{<:Any,MIME}
     # ugly code to fix an ugly performance problem
     local mime = nothing
     for m in allmimes
@@ -1051,6 +1052,7 @@ function show_richest(io::IO, @nospecialize(x))::Tuple{<:Any,MIME}
         nothing, mime
     end
 end
+precompile(show_richest, (IO, Tuple))
 
 # we write our own function instead of extending Base.showable with our new MIME because:
 # we need the method Base.showable(::MIME"asdfasdf", ::Any) = Tables.rowaccess(x)
@@ -1151,6 +1153,7 @@ function tree_data(@nospecialize(x::AbstractSet{<:Any}), context::IOContext)
         )
     end
 end
+precompile(tree_data, (Set, IOContext))
 
 function tree_data(@nospecialize(x::AbstractArray{<:Any,1}), context::IOContext)
     if Base.show_circular(context, x)
@@ -1188,6 +1191,7 @@ function tree_data(@nospecialize(x::AbstractArray{<:Any,1}), context::IOContext)
         )
     end
 end
+precompile(tree_data, (Vector{Int}, IOContext))
 
 function tree_data(@nospecialize(x::Tuple), context::IOContext)
     depth = get(context, :tree_viewer_depth, 0)
@@ -1199,6 +1203,7 @@ function tree_data(@nospecialize(x::Tuple), context::IOContext)
         :elements => collect(enumerate(format_output_default.(x, [recur_io]))),
     )
 end
+precompile(tree_data, (Tuple, IOContext))
 
 function tree_data(@nospecialize(x::AbstractDict{<:Any,<:Any}), context::IOContext)
     if Base.show_circular(context, x)
@@ -1234,13 +1239,14 @@ function tree_data(@nospecialize(x::AbstractDict{<:Any,<:Any}), context::IOConte
         )
     end
 end
+precompile(tree_data, (Dict, IOContext))
 
 function tree_data_nt_row(pair::Tuple, context::IOContext)
     # this is an entry of a NamedTuple, the first element of the Tuple is a Symbol, which we want to print as `x` instead of `:x`
     k, element = pair
     string(k), format_output_default(element, context)
 end
-
+precompile(tree_data_nt_row, (Tuple, IOContext))
 
 function tree_data(@nospecialize(x::NamedTuple), context::IOContext)
     depth = get(context, :tree_viewer_depth, 0)
@@ -1252,6 +1258,7 @@ function tree_data(@nospecialize(x::NamedTuple), context::IOContext)
         :elements => tree_data_nt_row.(zip(eachindex(x), x), (recur_io,))
     )
 end
+precompile(tree_data, (NamedTuple, IOContext))
 
 function tree_data(@nospecialize(x::Pair), context::IOContext)
     k, v = x
@@ -1261,6 +1268,7 @@ function tree_data(@nospecialize(x::Pair), context::IOContext)
         :key_value => (format_output_default(k, context), format_output_default(v, context)),
     )
 end
+precompile(tree_data, (Pair, IOContext))
 
 # Based on Julia source code but without writing to IO
 function tree_data(@nospecialize(x::Any), context::IOContext)
@@ -1302,8 +1310,8 @@ function tree_data(@nospecialize(x::Any), context::IOContext)
             :elements => elements,
         )
     end
-
 end
+precompile(tree_data, (Module, IOContext))
 
 function trynameof(::Type{Union{T,Missing}}) where T
     name = trynameof(T)
