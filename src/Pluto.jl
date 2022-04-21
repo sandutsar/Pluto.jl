@@ -97,4 +97,15 @@ if get(ENV, "JULIA_PLUTO_SHOW_BANNER", "1") != "0" && get(ENV, "CI", "🍄") != 
 \n"""
 end
 
+using PrecompileSignatures: precompilables, write_directives
+import FuzzyCompletions
+
+path = joinpath(pkgdir(Pluto), "src", "precompile.jl")
+if !isfile(path)
+    @info "Compiling some extra things"
+    types = precompilables(PlutoRunner)
+    write_directives(path, types)
+end
+include(path)
+
 end
