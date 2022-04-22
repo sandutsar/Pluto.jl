@@ -100,12 +100,15 @@ end
 using PrecompileSignatures: precompilables, write_directives
 import FuzzyCompletions
 
-path = joinpath(pkgdir(Pluto), "src", "precompile.jl")
-if !isfile(path)
-    @info "Compiling some extra things"
-    types = precompilables(PlutoRunner)
-    write_directives(path, types)
+"Generate some extra precompile directives during the precompile phase and precompile them."
+function generate_precompile_directives()
+    path = joinpath(pkgdir(Pluto), "src", "precompile.jl")
+    if !isfile(path)
+        types = precompilables(PlutoRunner)
+        write_directives(path, types)
+    end
+    return path
 end
-include(path)
+include(generate_precompile_directives())
 
 end

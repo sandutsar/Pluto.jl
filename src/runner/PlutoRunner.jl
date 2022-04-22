@@ -98,8 +98,10 @@ function wrap_dot(name)
     end
 end
 
+const MutableRefList = Vector{Pair{Symbol,Symbol}}
+
 """
-    collect_and_eliminate_globalrefs!(ref::Union{GlobalRef,Expr}, mutable_ref_list::Vector{Pair{Symbol,Symbol}}=[])
+    collect_and_eliminate_globalrefs!(ref::Union{GlobalRef,Expr}, mutable_ref_list::MutableRefList=[])
 
 Goes through an expression and removes all "global" references to workspace modules (e.g. Main.workspace#XXX).
 It collects the names that we replaced these references with, so that we can add assignments to these special names later.
@@ -109,8 +111,8 @@ We don't re-build the macro in every workspace, so we need to remove these refs 
 
 TODO? Don't remove the refs, but instead replace them with a new ref pointing to the new module?
 """
-function collect_and_eliminate_globalrefs!(ref::GlobalRef, mutable_ref_list=[])
-    test_mod_name = nameof(ref.mod) |> string
+function collect_and_eliminate_globalrefs!(ref::GlobalRef, mutable_ref_list::MutableRefList=[])
+    test_mod_name = string(nameof(ref.mod))
     if startswith(test_mod_name, "workspace#")
         new_name = gensym(ref.name)
         push!(mutable_ref_list, ref.name => new_name)
@@ -119,7 +121,7 @@ function collect_and_eliminate_globalrefs!(ref::GlobalRef, mutable_ref_list=[])
         ref
     end
 end
-function collect_and_eliminate_globalrefs!(expr::Expr, mutable_ref_list=[])
+function collect_and_eliminate_globalrefs!(expr::Expr, mutable_ref_list::MutableRefList=[])
     # Fix for .+ and .|> inside macros
     # https://github.com/fonsp/Pluto.jl/pull/1032#issuecomment-868819317
     # I'm unsure if this was all necessary but 🤷‍♀️
@@ -139,7 +141,7 @@ function collect_and_eliminate_globalrefs!(expr::Expr, mutable_ref_list=[])
 end
 collect_and_eliminate_globalrefs!(other, mutable_ref_list=[]) = other
 
-function globalref_to_workspaceref(expr)
+function globalref_to_workspaceref(expr::Expr)
     mutable_ref_list = Pair{Symbol, Symbol}[]
     new_expr = collect_and_eliminate_globalrefs!(expr, mutable_ref_list)
 
@@ -178,7 +180,6 @@ has_hook_style_pluto_properties_in_expr(::GiveMeRerunCellFunction) = true
 has_hook_style_pluto_properties_in_expr(::GiveMeRegisterCleanupFunction) = true
 has_hook_style_pluto_properties_in_expr(expr::Expr)::Bool = any(has_hook_style_pluto_properties_in_expr, expr.args)
 has_hook_style_pluto_properties_in_expr(other) = false
-
 
 function sanitize_expr(ref::GlobalRef)
     wrap_dot(ref)
@@ -245,7 +246,7 @@ module CantReturnInPluto
 end
 
 
-function try_macroexpand(mod, cell_uuid, expr)
+function try_macroexpand(mod::Module, cell_uuid::UUID, expr::Expr)
     # Remove the precvious cached expansion, so when we error somewhere before we update,
     # the old one won't linger around and get run accidentally.
     delete!(cell_expanded_exprs, cell_uuid)
@@ -286,7 +287,7 @@ function try_macroexpand(mod, cell_uuid, expr)
     return (sanitize_expr(expr_to_save), expr_hash(expr_to_save))
 end
 
-function get_module_names(workspace_module, module_ex::Expr)
+function get_module_names(workspace_module::Module, module_ex::Expr)
     try
         Core.eval(workspace_module, Expr(:call, :names, module_ex)) |> Set{Symbol}
     catch
@@ -294,7 +295,7 @@ function get_module_names(workspace_module, module_ex::Expr)
     end
 end
 
-function collect_soft_definitions(workspace_module, modules::Set{Expr})
+function collect_soft_definitions(workspace_module::Module, modules::Set{Expr})
   mapreduce(module_ex -> get_module_names(workspace_module, module_ex), union!, modules; init=Set{Symbol}())
 end
 
