@@ -1,4 +1,4 @@
-import { html, Component } from "../imports/Preact.js"
+import { html, Component, useState, useRef, useEffect, useLayoutEffect } from "../imports/Preact.js"
 
 import { utf8index_to_ut16index } from "../common/UnicodeTools.js"
 import { map_cmd_to_ctrl_on_mac } from "../common/KeyboardShortcuts.js"
@@ -7,13 +7,16 @@ import {
     EditorState,
     EditorSelection,
     EditorView,
-    placeholder,
+    placeholder as Placeholder,
     keymap,
     history,
     autocomplete,
     drawSelection,
     Compartment,
+    StateEffect,
 } from "../imports/CodemirrorPlutoSetup.js"
+import { guess_notebook_location } from "../common/NotebookLocationFromURL.js"
+import { tab_help_plugin } from "./CellInput/tab_help_plugin.js"
 
 let { autocompletion, completionKeymap } = autocomplete
 
@@ -21,81 +24,108 @@ let start_autocomplete_command = completionKeymap.find((keybinding) => keybindin
 let accept_autocomplete_command = completionKeymap.find((keybinding) => keybinding.key === "Enter")
 let close_autocomplete_command = completionKeymap.find((keybinding) => keybinding.key === "Escape")
 
+const assert_not_null = (x) => {
+    if (x == null) {
+        throw new Error("Unexpected null value")
+    } else {
+        return x
+    }
+}
+
+const set_cm_value = (/** @type{EditorView} */ cm, /** @type {string} */ value, scroll = true) => {
+    let had_focus_before = cm.hasFocus
+
+    cm.dispatch({
+        changes: { from: 0, to: cm.state.doc.length, insert: value },
+        selection: EditorSelection.cursor(value.length),
+        // a long path like /Users/fons/Documents/article-test-1/asdfasdfasdfsadf.jl does not fit in the little box, so we scroll it to the left so that you can see the filename easily.
+        scrollIntoView: scroll,
+    })
+
+    if (!had_focus_before) {
+        // and blur the DOM again (because the previous transaction might have re-focused it)
+        cm.contentDOM.blur()
+    }
+}
+
+const is_desktop = !!window.plutoDesktop
+
+if (is_desktop) {
+    console.log("Running in Desktop Environment! Found following properties/methods:", window.plutoDesktop)
+}
+
 /**
- * @typedef FilePickerProps
- * @type {{
+ * @param {{
  *  value: String,
  *  suggest_new_file: {base: String},
  *  button_label: String,
  *  placeholder: String,
  *  on_submit: (new_path: String) => Promise<void>,
+ *  on_desktop_submit?: (loc?: string) => Promise<void>,
  *  client: import("../common/PlutoConnection.js").PlutoConnection,
- * }}
- * @augments Component<FilePickerProps,{}>
+ * }} props
  */
-export class FilePicker extends Component {
-    constructor(/** @type {FilePickerProps} */ props) {
-        super(props)
-        this.state = {
-            is_button_disabled: true,
-        }
-        this.forced_value = ""
-        /** @type {EditorView} */
-        this.cm = null
+export const FilePicker = ({ value, suggest_new_file, button_label, placeholder, on_submit, on_desktop_submit, client }) => {
+    const [is_button_disabled, set_is_button_disabled] = useState(true)
+    const [url_value, set_url_value] = useState("")
+    const forced_value = useRef("")
+    /** @type {import("../imports/Preact.js").Ref<HTMLElement>} */
+    const base = useRef(/** @type {any} */ (null))
+    const cm = useRef(/** @type {EditorView?} */ (null))
 
-        this.suggest_not_tmp = () => {
-            const suggest = this.props.suggest_new_file
-            if (suggest != null && this.cm.state.doc.length === 0) {
-                // this.cm.focus()
-                this.cm.dispatch({
-                    changes: { from: 0, to: this.cm.state.doc.length, insert: suggest.base },
-                    selection: EditorSelection.cursor(suggest.base.length),
-                })
-                this.request_path_completions()
-            }
-            window.dispatchEvent(new CustomEvent("collapse_cell_selection", {}))
+    const suggest_not_tmp = () => {
+        const current_cm = cm.current
+        if (current_cm == null) return
+        if (suggest_new_file != null && current_cm.state.doc.length === 0) {
+            // current_cm.focus()
+            set_cm_value(current_cm, suggest_new_file.base, false)
+            request_path_completions()
         }
+        window.dispatchEvent(new CustomEvent("collapse_cell_selection", {}))
+    }
 
-        let run = async (fn) => await fn()
-        this.on_submit = () => {
-            const my_val = this.cm.state.doc.toString()
-            if (my_val === this.forced_value) {
-                this.suggest_not_tmp()
+    let run = async (fn) => await fn()
+
+    const onSubmit = () => {
+        const current_cm = cm.current
+        if (current_cm == null) return
+        if (!is_desktop) {
+            const my_val = current_cm.state.doc.toString()
+            if (my_val === forced_value.current) {
+                suggest_not_tmp()
                 return true
             }
-            run(async () => {
-                try {
-                    await this.props.on_submit(this.cm.state.doc.toString())
-                    this.cm.dom.blur()
-                } catch (error) {
-                    this.cm.dispatch({
-                        changes: { from: 0, to: this.cm.state.doc.length, insert: this.props.value },
-                        selection: EditorSelection.cursor(this.props.value.length),
-                    })
-                }
-            })
+        }
+        run(async () => {
+            try {
+                if (is_desktop && on_desktop_submit) {
+                    await on_desktop_submit((await guess_notebook_location(url_value)).path_or_url)
+                } else await on_submit(current_cm.state.doc.toString())
+                current_cm.dom.blur()
+            } catch (error) {
+                set_cm_value(current_cm, forced_value.current, true)
+                current_cm.dom.blur()
+            }
+        })
+        return true
+    }
+
+    const request_path_completions = () => {
+        const current_cm = cm.current
+        if (current_cm == null) return
+        let selection = current_cm.state.selection.main
+        if (selection.from !== selection.to) return
+        if (current_cm.state.doc.length !== selection.to) return
+        return assert_not_null(start_autocomplete_command).run(current_cm)
+    }
+
+    useLayoutEffect(() => {
+        const usesDarkTheme = window.matchMedia("(prefers-color-scheme: dark)").matches
+        const keyMapSubmit = () => {
+            onSubmit()
             return true
         }
-    }
-    componentDidUpdate() {
-        if (this.forced_value != this.props.value) {
-            this.cm.dispatch({
-                changes: { from: 0, to: this.cm.state.doc.length, insert: this.props.value },
-                selection: EditorSelection.cursor(this.props.value.length),
-            })
-            this.forced_value = this.props.value
-
-            // a long path like /Users/fons/Documents/article-test-1/asdfasdfasdfsadf.jl does not fit in the little box, so we scroll it to the left so that you can see the filename easily.
-            this.cm.scrollDOM.scrollLeft = 100000
-            setTimeout(() => {
-                // TODO: do we need this?
-                this.cm.scrollDOM.scrollLeft = 100000
-            }, 100)
-        }
-    }
-    componentDidMount() {
-        const usesDarkTheme = window.matchMedia("(prefers-color-scheme: dark)").matches
-        this.cm = new EditorView({
+        cm.current = new EditorView({
             state: EditorState.create({
                 doc: "",
                 extensions: [
@@ -103,10 +133,10 @@ export class FilePicker extends Component {
                     EditorView.domEventHandlers({
                         focus: (event, cm) => {
                             setTimeout(() => {
-                                if (this.props.suggest_new_file) {
-                                    this.suggest_not_tmp()
+                                if (suggest_new_file) {
+                                    suggest_not_tmp()
                                 } else if (cm.state.doc.length === 0) {
-                                    this.request_path_completions()
+                                    request_path_completions()
                                 }
                             }, 0)
                             return true
@@ -114,22 +144,14 @@ export class FilePicker extends Component {
                         blur: (event, cm) => {
                             setTimeout(() => {
                                 if (!cm.hasFocus) {
-                                    cm.dispatch({
-                                        changes: { from: 0, to: cm.state.doc.length, insert: this.props.value },
-                                        selection: EditorSelection.cursor(this.props.value.length),
-                                    })
-                                    cm.scrollPosIntoView(this.props.value.length)
-
-                                    setTimeout(() => {
-                                        this.cm.scrollPosIntoView(this.props.value.length)
-                                    }, 100)
+                                    set_cm_value(cm, forced_value.current, true)
                                 }
                             }, 200)
                         },
                     }),
                     EditorView.updateListener.of((update) => {
                         if (update.docChanged) {
-                            this.setState({ is_button_disabled: update.state.doc.length === 0 })
+                            set_is_button_disabled(update.state.doc.length === 0)
                         }
                     }),
                     EditorView.theme(
@@ -151,22 +173,25 @@ export class FilePicker extends Component {
                         activateOnTyping: true,
                         override: [
                             pathhints({
-                                suggest_new_file: this.props.suggest_new_file,
-                                client: this.props.client,
+                                suggest_new_file: suggest_new_file,
+                                client: client,
                             }),
                         ],
                         defaultKeymap: false, // We add these manually later, so we can override them if necessary
                         maxRenderedOptions: 512, // fons's magic number
-                        optionClass: (c) => c.type,
+                        optionClass: (c) => c.type ?? "",
                     }),
                     // When a completion is picked, immediately start autocompleting again
                     EditorView.updateListener.of((update) => {
                         update.transactions.forEach((transaction) => {
                             const completion = transaction.annotation(autocomplete.pickedCompletion)
                             if (completion != null) {
-                                update.view.scrollPosIntoView(update.state.doc.length)
+                                update.view.dispatch({
+                                    effects: EditorView.scrollIntoView(update.state.doc.length),
+                                    selection: EditorSelection.cursor(update.state.doc.length),
+                                })
 
-                                this.request_path_completions()
+                                request_path_completions()
                             }
                         })
                     }),
@@ -175,19 +200,31 @@ export class FilePicker extends Component {
                             key: "Enter",
                             run: (cm) => {
                                 // If there is autocomplete open, accept that. It will return `true`
-                                return accept_autocomplete_command.run(cm)
+                                return assert_not_null(accept_autocomplete_command).run(cm)
                             },
                         },
-                        { key: "Enter", run: this.on_submit },
-                        { key: "Ctrl-Enter", mac: "Cmd-Enter", run: this.on_submit },
-                        { key: "Ctrl-Shift-Enter", mac: "Cmd-Shift-Enter", run: this.on_submit },
+                        {
+                            key: "Enter",
+                            run: keyMapSubmit,
+                        },
+                        {
+                            key: "Ctrl-Enter",
+                            mac: "Cmd-Enter",
+                            run: keyMapSubmit,
+                        },
+                        {
+                            key: "Ctrl-Shift-Enter",
+                            mac: "Cmd-Shift-Enter",
+                            run: keyMapSubmit,
+                        },
                         {
                             key: "Escape",
                             run: (cm) => {
-                                close_autocomplete_command.run(cm)
+                                assert_not_null(close_autocomplete_command).run(cm)
                                 cm.dispatch({
-                                    changes: { from: 0, to: cm.state.doc.length, insert: this.props.value },
-                                    selection: EditorSelection.cursor(this.props.value.length),
+                                    changes: { from: 0, to: cm.state.doc.length, insert: forced_value.current },
+                                    selection: EditorSelection.cursor(value.length),
+                                    effects: EditorView.scrollIntoView(forced_value.current.length),
                                 })
                                 // @ts-ignore
                                 document.activeElement.blur()
@@ -199,45 +236,59 @@ export class FilePicker extends Component {
                             key: "Tab",
                             run: (cm) => {
                                 // If there is autocomplete open, accept that
-                                if (accept_autocomplete_command.run(cm)) {
+                                if (assert_not_null(accept_autocomplete_command).run(cm)) {
                                     // and request the next ones
-                                    this.request_path_completions()
+                                    request_path_completions()
                                     return true
                                 }
                                 // Else, activate it (possibly)
-                                return this.request_path_completions()
+                                return request_path_completions()
                             },
                         },
                     ]),
                     keymap.of(completionKeymap),
 
-                    placeholder(this.props.placeholder),
+                    Placeholder(placeholder),
+                    tab_help_plugin,
                 ],
             }),
         })
-        this.base.insertBefore(this.cm.dom, this.base.firstElementChild)
+        const current_cm = cm.current
 
+        if (!is_desktop) base.current.insertBefore(current_cm.dom, base.current.firstElementChild)
         // window.addEventListener("resize", () => {
-        //     if (!this.cm.hasFocus()) {
-        //         deselect(this.cm)
+        //     if (!cm.current.hasFocus()) {
+        //         deselect(cm.current)
         //     }
         // })
-    }
-    render() {
-        return html`
-            <pluto-filepicker>
-                <button onClick=${this.on_submit} disabled=${this.state.is_button_disabled}>${this.props.button_label}</button>
-            </pluto-filepicker>
-        `
-    }
+    }, [])
 
-    request_path_completions() {
-        let selection = this.cm.state.selection.main
-        if (selection.from !== selection.to) return
-        if (this.cm.state.doc.length !== selection.to) return
+    useLayoutEffect(() => {
+        if (forced_value.current != value) {
+            if (cm.current == null) return
+            set_cm_value(cm.current, value, true)
+            forced_value.current = value
+        }
+    })
 
-        return start_autocomplete_command.run(this.cm)
-    }
+    return is_desktop
+        ? html`<div class="desktop_picker_group" ref=${base}>
+              <input
+                  value=${url_value}
+                  placeholder="Enter notebook URL..."
+                  onChange=${(v) => {
+                      set_url_value(v.target.value)
+                  }}
+              />
+              <div onClick=${onSubmit} class="desktop_picker">
+                  <button>${button_label}</button>
+              </div>
+          </div>`
+        : html`
+              <pluto-filepicker ref=${base}>
+                  <button onClick=${onSubmit} disabled=${is_button_disabled}>${button_label}</button>
+              </pluto-filepicker>
+          `
 }
 
 const pathhints =
